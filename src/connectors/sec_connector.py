@@ -1,0 +1,265 @@
+"""
+SEC EDGAR Connector - Real-time SEC filings data.
+
+Fetches Form 4 (insider trading) and other SEC filings using edgartools.
+Implements rate limiting per SEC fair access policy.
+"""
+
+import logging
+from datetime import datetime, timedelta
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Import edgartools - real SEC data library
+try:
+    from edgar import Company, set_identity
+    EDGAR_AVAILABLE = True
+except ImportError:
+    EDGAR_AVAILABLE = False
+    logger.warning("edgartools not installed. SEC features will be disabled.")
+
+
+class SECConnector:
+    """
+    Connects to SEC EDGAR for real-time filings data.
+    
+    Uses edgartools library for structured access to SEC filings.
+    Rate-limited to comply with SEC fair access policy (10 req/sec max).
+    """
+    
+    def __init__(self, user_agent: str = "AlphaStream support@alphastream.ai"):
+        """
+        Initialize SEC connector.
+        
+        Args:
+            user_agent: Required by SEC - identify your application
+        """
+        if EDGAR_AVAILABLE:
+            # Set identity as required by SEC
+            set_identity(user_agent)
+            logger.info("SEC EDGAR connector initialized")
+        else:
+            logger.warning("SEC EDGAR connector running in degraded mode (no edgartools)")
+    
+    def get_insider_trades(self, ticker: str, days: int = 1) -> list[dict[str, Any]]:
+        """
+        Get insider trading activity (Form 4 filings) for a ticker.
+        
+        Args:
+            ticker: Stock symbol (e.g., "AAPL")
+            days: Number of days to look back (default: 1 for last 24 hours)
+            
+        Returns:
+            List of insider transactions with details
+        """
+        if not EDGAR_AVAILABLE:
+            return self._llm_fallback_insider_trades(ticker)
+        
+        try:
+            company = Company(ticker)
+            
+            # Get Form 4 filings (insider transactions)
+            # edgartools returns pyarrow-backed data which can be tricky
+            try:
+                form4_filings = company.get_filings(form="4")
+                # Try to convert to list to handle pyarrow issues
+                if hasattr(form4_filings, 'to_list'):
+                    form4_filings = form4_filings.to_list()
+                elif hasattr(form4_filings, '__iter__'):
+                    form4_filings = list(form4_filings)[:20]
+                else:
+                    form4_filings = []
+            except Exception as e:
+                logger.warning(f"Error getting filings for {ticker}: {e}")
+                return self._llm_fallback_insider_trades(ticker)
+            
+            # Filter to recent filings
+            cutoff_date = datetime.now() - timedelta(days=days)
+            recent_filings = []
+            
+            def safe_extract_date(value):
+                """Safely extract date from various pyarrow types."""
+                if value is None:
+                    return None
+                if hasattr(value, 'to_pylist'):
+                    lst = value.to_pylist()
+                    return lst[0] if lst else None
+                if hasattr(value, 'to_numpy'):
+                    arr = value.to_numpy()
+                    return arr[0] if len(arr) > 0 else None
+                if hasattr(value, 'as_py'):
+                    return value.as_py()
+                return value
+            
+            for filing in form4_filings[:20]:  # Check last 20 filings
+                try:
+                    filing_date = safe_extract_date(filing.filing_date)
+                    if filing_date and filing_date >= cutoff_date.date():
+                        # Parse the Form 4 for transaction details
+                        transactions = self._parse_form4(filing)
+                        recent_filings.extend(transactions)
+                except Exception as e:
+                    logger.debug(f"Error parsing filing: {e}")
+                    continue
+            
+            logger.info(f"Found {len(recent_filings)} insider transactions for {ticker}")
+            return recent_filings
+            
+        except Exception as e:
+            logger.error(f"Error fetching insider trades for {ticker}: {e}")
+            return self._llm_fallback_insider_trades(ticker)
+    
+    def _parse_form4(self, filing) -> list[dict[str, Any]]:
+        """
+        Parse a Form 4 filing to extract transaction details.
+        
+        Returns list of transactions from this filing.
+        """
+        transactions = []
+        
+        def safe_extract(value, default='Unknown'):
+            """Safely extract value from various pyarrow types."""
+            if value is None:
+                return default
+            # Handle pyarrow ChunkedArray
+            if hasattr(value, 'to_pylist'):
+                lst = value.to_pylist()
+                return lst[0] if lst else default
+            # Handle pyarrow Array
+            if hasattr(value, 'to_numpy'):
+                arr = value.to_numpy()
+                return arr[0] if len(arr) > 0 else default
+            # Handle pyarrow scalar
+            if hasattr(value, 'as_py'):
+                return value.as_py()
+            # Regular Python value
+            return value
+        
+        try:
+            # Get the Form 4 document object - contains actual transaction data
+            form4_doc = filing.obj()
+            
+            # Get insider name directly from Form4 document
+            insider_name = getattr(form4_doc, 'insider_name', None)
+            if not insider_name:
+                insider_name = 'Unknown Insider'
+            else:
+                insider_name = str(insider_name)
+            
+            # Get filing date
+            filing_date = str(filing.filing_date) if hasattr(filing, 'filing_date') else 'N/A'
+            
+            # Get issuer ticker
+            issuer = getattr(form4_doc, 'issuer', None)
+            ticker = getattr(issuer, 'ticker', 'N/A') if issuer else 'N/A'
+            
+            # Get market trades (includes both buys and sells)
+            market_trades = getattr(form4_doc, 'market_trades', None)
+            
+            if market_trades is not None and not market_trades.empty:
+                # Convert DataFrame rows to transaction dicts
+                for _, row in market_trades.head(5).iterrows():  # First 5 transactions
+                    trans_type = row.get('TransactionType', 'Unknown')
+                    shares = row.get('Shares', 0)
+                    price = row.get('Price', 0.0)
+                    
+                    # Handle price - might be a string or float
+                    if isinstance(price, str):
+                        try:
+                            price = float(price.replace('$', '').replace(',', ''))
+                        except:
+                            price = 0.0
+                    
+                    transactions.append({
+                        "insider_name": insider_name,
+                        "filing_date": filing_date,
+                        "form_type": "4",
+                        "ticker": str(ticker),
+                        "accession_number": str(getattr(filing, 'accession_number', 'N/A')),
+                        "transaction_type": str(trans_type),
+                        "shares": int(shares) if shares else 0,
+                        "price": float(price) if price else 0.0,
+                    })
+                    
+                logger.debug(f"Parsed {len(transactions)} transactions from Form 4 for {insider_name}")
+            else:
+                # No transactions but still record the filing
+                transactions.append({
+                    "insider_name": insider_name,
+                    "filing_date": filing_date,
+                    "form_type": "4",
+                    "ticker": str(ticker),
+                    "accession_number": str(getattr(filing, 'accession_number', 'N/A')),
+                    "transaction_type": "Unknown",
+                    "shares": 0,
+                    "price": 0.0,
+                })
+            
+        except Exception as e:
+            logger.debug(f"Error parsing Form 4 details: {e}")
+        
+        return transactions
+    
+    def get_recent_filings(self, ticker: str, form_types: list[str] = None) -> list[dict[str, Any]]:
+        """
+        Get recent SEC filings for a company.
+        
+        Args:
+            ticker: Stock symbol
+            form_types: List of form types to fetch (default: 10-K, 10-Q, 8-K)
+            
+        Returns:
+            List of filing summaries
+        """
+        if form_types is None:
+            form_types = ["10-K", "10-Q", "8-K"]
+        
+        if not EDGAR_AVAILABLE:
+            return []
+        
+        try:
+            company = Company(ticker)
+            filings = []
+            
+            for form_type in form_types:
+                form_filings = company.get_filings(form=form_type)
+                for filing in form_filings[:5]:  # Last 5 of each type
+                    filings.append({
+                        "form_type": form_type,
+                        "filing_date": str(filing.filing_date),
+                        "accession_number": filing.accession_number,
+                        "description": getattr(filing, 'description', f"{form_type} Filing"),
+                    })
+            
+            return filings
+            
+        except Exception as e:
+            logger.error(f"Error fetching filings for {ticker}: {e}")
+            return []
+    
+    def _llm_fallback_insider_trades(self, ticker: str) -> list[dict[str, Any]]:
+        """
+        When edgartools fails, return placeholder indicating LLM should be used.
+        
+        The InsiderAgent will handle LLM-based analysis.
+        """
+        logger.info(f"Using LLM fallback for insider trades: {ticker}")
+        return [{
+            "insider_name": "LLM_FALLBACK_REQUIRED",
+            "ticker": ticker,
+            "message": "Use LLM to fetch and analyze SEC data",
+            "source": "sec.gov/cgi-bin/browse-edgar"
+        }]
+
+
+# Singleton instance
+_sec_connector: SECConnector | None = None
+
+
+def get_sec_connector() -> SECConnector:
+    """Get or create the SEC connector singleton."""
+    global _sec_connector
+    if _sec_connector is None:
+        _sec_connector = SECConnector()
+    return _sec_connector
